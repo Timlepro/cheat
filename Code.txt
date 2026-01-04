@@ -1,3 +1,4 @@
+loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 print("Code chargé depuis GitHub ✅")
 
 local p=game:GetService("Players")
