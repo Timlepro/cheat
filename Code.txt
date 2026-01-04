@@ -358,3 +358,10 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
 		toggleAim()
 	end
 end)
+print("Code chargé depuis GitHub ✅")
+
+local p=game:GetService("Players")
+p.PlayerAdded:Connect(function(plr)
+	print(plr.Name.." vient de rejoindre !")
+end)
+
