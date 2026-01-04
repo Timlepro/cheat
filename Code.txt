@@ -1,0 +1,742 @@
+--============================================================
+-- ADMIN DEBUG (OWN GAME ONLY)
+-- This package is split into 2 parts (SERVER + CLIENT) because Roblox
+-- requires server-authoritative teleport and client-side camera/overlay.
+--
+-- Put Part A in: ServerScriptService/AdminDebug.server.lua
+-- Put Part B in: StarterPlayerScripts/AdminDebug.client.lua
+--============================================================
+
+
+--============================================================
+-- Part A) ServerScriptService/AdminDebug.server.lua
+--============================================================
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local ADMIN_USER_ID = 10280088666
+
+local remote = ReplicatedStorage:FindFirstChild("AdminDebug_Remote")
+if not remote then
+	remote = Instance.new("RemoteEvent")
+	remote.Name = "AdminDebug_Remote"
+	remote.Parent = ReplicatedStorage
+end
+
+local lastTp = {} :: {[Player]: number}
+
+local function isAdmin(plr: Player): boolean
+	return plr and plr.UserId == ADMIN_USER_ID
+end
+
+local function getTorso(char: Model?): BasePart?
+	if not char then return nil end
+	return (char:FindFirstChild("HumanoidRootPart") :: BasePart?)
+		or (char:FindFirstChild("UpperTorso") :: BasePart?)
+		or (char:FindFirstChild("Torso") :: BasePart?)
+end
+
+local function getClosestPlayerTo(plr: Player): Player?
+	local myChar = plr.Character
+	local myTorso = getTorso(myChar)
+	if not myTorso then return nil end
+
+	local best: Player? = nil
+	local bestDist = math.huge
+
+	for _, other in ipairs(Players:GetPlayers()) do
+		if other ~= plr then
+			local ot = getTorso(other.Character)
+			if ot then
+				local d = (ot.Position - myTorso.Position).Magnitude
+				if d < bestDist then
+					bestDist = d
+					best = other
+				end
+			end
+		end
+	end
+
+	return best
+end
+
+local function teleportAbove(plr: Player, target: Player)
+	local char = plr.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local myTorso = getTorso(char)
+	local tTorso = getTorso(target.Character)
+	if not hum or not myTorso or not tTorso then return end
+
+	-- 6 studs above + face same direction as target
+	local pos = tTorso.Position + Vector3.new(0, 6, 0)
+	myTorso.CFrame = CFrame.new(pos, pos + tTorso.CFrame.LookVector)
+	myTorso.AssemblyLinearVelocity = Vector3.zero
+	myTorso.AssemblyAngularVelocity = Vector3.zero
+end
+
+remote.OnServerEvent:Connect(function(plr: Player, action: string)
+	if not isAdmin(plr) then return end
+
+	if action == "TP_ABOVE_CLOSEST" then
+		local now = os.clock()
+		local last = lastTp[plr] or 0
+		if now - last < 0.35 then
+			return
+		end
+		lastTp[plr] = now
+
+		local closest = getClosestPlayerTo(plr)
+		if closest then
+			teleportAbove(plr, closest)
+		end
+	end
+end)
+
+Players.PlayerAdded:Connect(function(plr)
+	if isAdmin(plr) then
+		plr:SetAttribute("AdminDebugEnabled", true)
+	else
+		plr:SetAttribute("AdminDebugEnabled", false)
+	end
+end)
+
+
+
+--============================================================
+-- Part B) StarterPlayerScripts/AdminDebug.client.lua
+--============================================================
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+
+local localPlayer = Players.LocalPlayer
+local ADMIN_USER_ID = 10280088666
+
+if localPlayer.UserId ~= ADMIN_USER_ID then
+	script:Destroy()
+	return
+end
+
+-- Wait for server attribute (lets you disable easily later)
+while localPlayer:GetAttribute("AdminDebugEnabled") == nil do
+	task.wait(0.05)
+end
+if localPlayer:GetAttribute("AdminDebugEnabled") ~= true then
+	script:Destroy()
+	return
+end
+
+local remote = ReplicatedStorage:WaitForChild("AdminDebug_Remote")
+
+--==================== CONFIG ====================
+local RED   = Color3.fromRGB(255, 0, 0)
+local GREEN = Color3.fromRGB(0, 255, 0)
+local BLUE  = Color3.fromRGB(0, 170, 255)
+
+local OVERLAY_KEY = Enum.KeyCode.L       -- toggle overlay
+local TELEPORT_KEY = Enum.KeyCode.T      -- toggle "follow teleport above closest"
+local TRACK_KEY = Enum.KeyCode.P         -- toggle camera track (spectate-like)
+
+local TELEPORT_INTERVAL = 0.45           -- seconds
+local CLOSEST_REFRESH = 0.12             -- seconds
+local NAME_REFRESH = 0.12                -- seconds
+
+--==================== STATE ====================
+local folder = Instance.new("Folder")
+folder.Name = "AdminDebug_LocalOnly"
+folder.Parent = workspace
+
+local overlayEnabled = true
+local teleportFollow = false
+local trackEnabled = false
+
+local dots = {}        -- [player] = BillboardGui
+local dotLabels = {}   -- [player] = TextLabel
+local atts = {}        -- [player] = Attachment (main)
+local beams = {}       -- [player] = Beam (from local to target)
+
+local jointFolders = {} -- [player] = Folder
+local jointDots = {}    -- [player] = {BillboardGui...}
+local jointBeams = {}   -- [player] = {Beam...}
+
+local localAtt: Attachment? = nil
+local closestPlr: Player? = nil
+local nextClosestScan = 0
+
+-- camera tracking
+local camConn: RBXScriptConnection? = nil
+local savedCamType, savedCamSubject = nil, nil
+local localOffset = Vector3.new(0, 2, 10)
+local nextScanTrack = 0
+local currentTargetTorso: BasePart? = nil
+local currentNameGui: BillboardGui? = nil
+
+--==================== RIG LINKS (R15) ====================
+local JOINT_PAIRS = {
+	{"Head","NeckRigAttachment","UpperTorso","NeckRigAttachment"},
+
+	{"UpperTorso","LeftShoulderRigAttachment","LeftUpperArm","LeftShoulderRigAttachment"},
+	{"LeftUpperArm","LeftElbowRigAttachment","LeftLowerArm","LeftElbowRigAttachment"},
+	{"LeftLowerArm","LeftWristRigAttachment","LeftHand","LeftWristRigAttachment"},
+
+	{"UpperTorso","RightShoulderRigAttachment","RightUpperArm","RightShoulderRigAttachment"},
+	{"RightUpperArm","RightElbowRigAttachment","RightLowerArm","RightElbowRigAttachment"},
+	{"RightLowerArm","RightWristRigAttachment","RightHand","RightWristRigAttachment"},
+
+	{"UpperTorso","WaistRigAttachment","LowerTorso","WaistRigAttachment"},
+
+	{"LowerTorso","LeftHipRigAttachment","LeftUpperLeg","LeftHipRigAttachment"},
+	{"LeftUpperLeg","LeftKneeRigAttachment","LeftLowerLeg","LeftKneeRigAttachment"},
+	{"LeftLowerLeg","LeftAnkleRigAttachment","LeftFoot","LeftAnkleRigAttachment"},
+
+	{"LowerTorso","RightHipRigAttachment","RightUpperLeg","RightHipRigAttachment"},
+	{"RightUpperLeg","RightKneeRigAttachment","RightLowerLeg","RightKneeRigAttachment"},
+	{"RightLowerLeg","RightAnkleRigAttachment","RightFoot","RightAnkleRigAttachment"},
+}
+
+-- fallback R6 "bones"
+local R6_PART_PAIRS = {
+	{"Head","Torso"},
+	{"Torso","Left Arm"},
+	{"Torso","Right Arm"},
+	{"Torso","Left Leg"},
+	{"Torso","Right Leg"},
+}
+
+--==================== UTILS ====================
+local function getTorsoPart(char: Model?): BasePart?
+	if not char then return nil end
+	return (char:FindFirstChild("UpperTorso") :: BasePart?)
+		or (char:FindFirstChild("Torso") :: BasePart?)
+		or (char:FindFirstChild("HumanoidRootPart") :: BasePart?)
+end
+
+local function getHeadPart(char: Model?): BasePart?
+	if not char then return nil end
+	return (char:FindFirstChild("Head") :: BasePart?) or getTorsoPart(char)
+end
+
+local function setDotColor(plr: Player, c: Color3)
+	local lbl = dotLabels[plr]
+	if lbl then lbl.TextColor3 = c end
+end
+
+local function setBeamColor(plr: Player, c: Color3)
+	local b = beams[plr]
+	if b then b.Color = ColorSequence.new(c) end
+end
+
+local function setOverlayEnabled(on: boolean)
+	overlayEnabled = on
+
+	-- main dots + beams
+	for _, gui in pairs(dots) do
+		if gui then gui.Enabled = on end
+	end
+	for _, b in pairs(beams) do
+		if b then b.Enabled = on end
+	end
+
+	-- joints
+	for _, arr in pairs(jointDots) do
+		for _, gui in ipairs(arr) do
+			if gui then gui.Enabled = on end
+		end
+	end
+	for _, arr in pairs(jointBeams) do
+		for _, b in ipairs(arr) do
+			if b then b.Enabled = on end
+		end
+	end
+
+	-- name
+	if currentNameGui then
+		currentNameGui.Enabled = on
+	end
+end
+
+local function destroyNameGui()
+	if currentNameGui then
+		currentNameGui:Destroy()
+		currentNameGui = nil
+	end
+end
+
+local function makeBillboardDot(parent: Instance, adornee: Instance, name: string, sizePx: number, color: Color3)
+	local gui = Instance.new("BillboardGui")
+	gui.Name = name
+	gui.Adornee = adornee
+	gui.AlwaysOnTop = true
+	gui.Size = UDim2.new(0, sizePx, 0, sizePx)
+	gui.StudsOffsetWorldSpace = Vector3.new(0, 0, 0)
+	gui.Enabled = overlayEnabled
+	gui.Parent = parent
+
+	local txt = Instance.new("TextLabel")
+	txt.BackgroundTransparency = 1
+	txt.Size = UDim2.new(1, 0, 1, 0)
+	txt.Text = "●"
+	txt.Font = Enum.Font.GothamBold
+	txt.TextScaled = true
+	txt.TextColor3 = color
+	txt.Parent = gui
+
+	return gui, txt
+end
+
+local function makeBeam(parent: Instance, att0: Attachment, att1: Attachment, color: Color3, name: string)
+	local beam = Instance.new("Beam")
+	beam.Name = name
+	beam.Attachment0 = att0
+	beam.Attachment1 = att1
+	beam.FaceCamera = true
+	beam.Width0 = 0.08
+	beam.Width1 = 0.08
+	beam.Transparency = NumberSequence.new(0)
+	beam.LightEmission = 1
+	beam.Color = ColorSequence.new(color)
+	beam.Enabled = overlayEnabled
+	beam.Parent = parent
+	return beam
+end
+
+local function clearFor(plr: Player)
+	if beams[plr] then beams[plr]:Destroy() beams[plr] = nil end
+	if dots[plr] then dots[plr]:Destroy() dots[plr] = nil end
+	if atts[plr] then atts[plr]:Destroy() atts[plr] = nil end
+	dotLabels[plr] = nil
+
+	if jointFolders[plr] then jointFolders[plr]:Destroy() jointFolders[plr] = nil end
+	jointDots[plr] = nil
+	jointBeams[plr] = nil
+
+	if closestPlr == plr then
+		closestPlr = nil
+	end
+end
+
+--==================== MAIN DOT/ATT ====================
+local function makeMainAttachment(char: Model, plr: Player)
+	local torso = getTorsoPart(char) or (char and char:WaitForChild("HumanoidRootPart", 10))
+	if not torso then return nil end
+
+	local old = torso:FindFirstChild("AdminDebug_Att")
+	if old then old:Destroy() end
+
+	local att = Instance.new("Attachment")
+	att.Name = "AdminDebug_Att"
+
+	if torso.Name == "HumanoidRootPart" then
+		att.Position = Vector3.new(0, 1.2, 0) -- chest-ish
+	else
+		att.Position = Vector3.new(0, 0, 0)
+	end
+
+	att.Parent = torso
+	atts[plr] = att
+	return att
+end
+
+local function makeMainDot(plr: Player, att: Attachment)
+	if dots[plr] then dots[plr]:Destroy() dots[plr] = nil end
+	if not att then return end
+
+	local gui, txt = makeBillboardDot(folder, att, "AdminDebug_Dot_" .. plr.UserId, 16, RED)
+	dots[plr] = gui
+	dotLabels[plr] = txt
+end
+
+--==================== JOINT SKELETON (BLUE) ====================
+local function getOrMakePartAttachment(part: BasePart, name: string): Attachment
+	local existing = part:FindFirstChild(name)
+	if existing and existing:IsA("Attachment") then
+		return existing
+	end
+	local a = Instance.new("Attachment")
+	a.Name = name
+	a.Position = Vector3.new(0, 0, 0)
+	a.Parent = part
+	return a
+end
+
+local function getRigAttachment(char: Model, partName: string, attName: string): Attachment?
+	local part = char:FindFirstChild(partName)
+	if not part or not part:IsA("BasePart") then return nil end
+	local att = part:FindFirstChild(attName)
+	if att and att:IsA("Attachment") then
+		return att
+	end
+	return nil
+end
+
+local function makeJointSkeleton(char: Model, plr: Player)
+	if jointFolders[plr] then jointFolders[plr]:Destroy() end
+
+	local jf = Instance.new("Folder")
+	jf.Name = "AdminDebug_Joints_" .. plr.UserId
+	jf.Parent = folder
+	jointFolders[plr] = jf
+
+	local dotsArr = {}
+	local beamsArr = {}
+	jointDots[plr] = dotsArr
+	jointBeams[plr] = beamsArr
+
+	local seen = {} :: {[Attachment]: boolean}
+
+	-- Try R15 rig attachments first
+	local anyR15 = false
+	for _, pair in ipairs(JOINT_PAIRS) do
+		local a0 = getRigAttachment(char, pair[1], pair[2])
+		local a1 = getRigAttachment(char, pair[3], pair[4])
+		if a0 and a1 then
+			anyR15 = true
+
+			if not seen[a0] then
+				seen[a0] = true
+				local g = makeBillboardDot(jf, a0, "J_" .. a0.Name, 10, BLUE)
+				table.insert(dotsArr, g)
+			end
+			if not seen[a1] then
+				seen[a1] = true
+				local g = makeBillboardDot(jf, a1, "J_" .. a1.Name, 10, BLUE)
+				table.insert(dotsArr, g)
+			end
+
+			table.insert(beamsArr, makeBeam(jf, a0, a1, BLUE, "JB_" .. pair[2]))
+		end
+	end
+
+	if anyR15 then
+		return
+	end
+
+	-- Fallback R6: create attachments on parts and connect
+	for _, pair in ipairs(R6_PART_PAIRS) do
+		local p0 = char:FindFirstChild(pair[1])
+		local p1 = char:FindFirstChild(pair[2])
+		if p0 and p1 and p0:IsA("BasePart") and p1:IsA("BasePart") then
+			local a0 = getOrMakePartAttachment(p0, "AdminDebug_R6_" .. pair[1])
+			local a1 = getOrMakePartAttachment(p1, "AdminDebug_R6_" .. pair[2])
+
+			if not seen[a0] then
+				seen[a0] = true
+				local g = makeBillboardDot(jf, a0, "R6_" .. a0.Name, 10, BLUE)
+				table.insert(dotsArr, g)
+			end
+			if not seen[a1] then
+				seen[a1] = true
+				local g = makeBillboardDot(jf, a1, "R6_" .. a1.Name, 10, BLUE)
+				table.insert(dotsArr, g)
+			end
+
+			table.insert(beamsArr, makeBeam(jf, a0, a1, BLUE, "R6B_" .. pair[1] .. "_" .. pair[2]))
+		end
+	end
+end
+
+--==================== TRACER BEAMS ====================
+local function makeBeamTo(plr: Player)
+	if plr == localPlayer then return end
+	if beams[plr] then beams[plr]:Destroy() beams[plr] = nil end
+	if not localAtt then return end
+
+	local targetAtt = atts[plr]
+	if not targetAtt then return end
+
+	local beam = Instance.new("Beam")
+	beam.Name = "AdminDebug_Tracer_" .. plr.UserId
+	beam.Attachment0 = localAtt
+	beam.Attachment1 = targetAtt
+	beam.FaceCamera = true
+	beam.Width0 = 0.10
+	beam.Width1 = 0.10
+	beam.Transparency = NumberSequence.new(0)
+	beam.LightEmission = 1
+	beam.Color = ColorSequence.new(RED)
+	beam.Enabled = overlayEnabled
+	beam.Parent = folder
+
+	beams[plr] = beam
+end
+
+local function rebuildBeams()
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= localPlayer then
+			makeBeamTo(plr)
+		end
+	end
+end
+
+--==================== CLOSEST ====================
+local function getClosestOtherPlayer(): Player?
+	local myTorso = getTorsoPart(localPlayer.Character)
+	if not myTorso then return nil end
+
+	local best: Player? = nil
+	local bestDist = math.huge
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= localPlayer then
+			local t = getTorsoPart(plr.Character)
+			if t then
+				local d = (t.Position - myTorso.Position).Magnitude
+				if d < bestDist then
+					bestDist = d
+					best = plr
+				end
+			end
+		end
+	end
+
+	return best
+end
+
+local function updateClosestHighlight()
+	local now = os.clock()
+	if now < nextClosestScan then return end
+	nextClosestScan = now + CLOSEST_REFRESH
+
+	local best = getClosestOtherPlayer()
+	if best == closestPlr then return end
+
+	-- reset old
+	if closestPlr then
+		setDotColor(closestPlr, RED)
+		setBeamColor(closestPlr, RED)
+	end
+
+	closestPlr = best
+
+	-- set new
+	if closestPlr then
+		setDotColor(closestPlr, GREEN)
+		setBeamColor(closestPlr, GREEN)
+	end
+end
+
+--==================== NAME TAG ON TARGET ====================
+local function createNameGuiOn(part: BasePart)
+	destroyNameGui()
+
+	local plr = Players:GetPlayerFromCharacter(part.Parent)
+	if not plr then return end
+
+	local gui = Instance.new("BillboardGui")
+	gui.Name = "AdminDebug_TargetName"
+	gui.Adornee = part
+	gui.AlwaysOnTop = true
+	gui.Size = UDim2.new(0, 260, 0, 46)
+	gui.StudsOffsetWorldSpace = Vector3.new(0, 3, 0)
+	gui.Enabled = overlayEnabled
+	gui.Parent = folder
+
+	local txt = Instance.new("TextLabel")
+	txt.BackgroundTransparency = 1
+	txt.Size = UDim2.new(1, 0, 1, 0)
+	txt.Font = Enum.Font.GothamBold
+	txt.TextScaled = true
+	txt.TextColor3 = Color3.fromRGB(255, 255, 255)
+	txt.TextStrokeTransparency = 0.2
+	txt.Text = plr.Name
+	txt.Parent = gui
+
+	currentNameGui = gui
+end
+
+--==================== CAMERA TRACK (SPECTATE-LIKE) ====================
+local function setTargetTorso(torso: BasePart?)
+	if currentTargetTorso == torso then return end
+	currentTargetTorso = torso
+
+	if torso and torso.Parent then
+		createNameGuiOn(getHeadPart(torso.Parent) or torso)
+	else
+		destroyNameGui()
+	end
+end
+
+local function enableTrack()
+	if trackEnabled then return end
+	trackEnabled = true
+
+	local cam = workspace.CurrentCamera
+	savedCamType = cam.CameraType
+	savedCamSubject = cam.CameraSubject
+
+	cam.CameraType = Enum.CameraType.Scriptable
+
+	local myTorso = getTorsoPart(localPlayer.Character)
+	if myTorso then
+		localOffset = myTorso.CFrame:VectorToObjectSpace(cam.CFrame.Position - myTorso.Position)
+	end
+
+	nextScanTrack = 0
+	setTargetTorso(nil)
+
+	camConn = RunService.RenderStepped:Connect(function()
+		if not trackEnabled then return end
+
+		local myTorso2 = getTorsoPart(localPlayer.Character)
+		if not myTorso2 then return end
+
+		local now = os.clock()
+		if now >= nextScanTrack or (not currentTargetTorso) or (not currentTargetTorso.Parent) then
+			local best = getClosestOtherPlayer()
+			local torso = best and getTorsoPart(best.Character) or nil
+			setTargetTorso(torso)
+			nextScanTrack = now + NAME_REFRESH
+		end
+
+		local camPos = myTorso2.Position + myTorso2.CFrame:VectorToWorldSpace(localOffset)
+
+		local lookAtPos
+		if currentTargetTorso and currentTargetTorso.Parent then
+			lookAtPos = currentTargetTorso.Position
+		else
+			lookAtPos = myTorso2.Position + (myTorso2.CFrame.LookVector * 100)
+		end
+
+		cam.CFrame = CFrame.new(camPos, lookAtPos)
+	end)
+end
+
+local function disableTrack()
+	if not trackEnabled then return end
+	trackEnabled = false
+
+	if camConn then
+		camConn:Disconnect()
+		camConn = nil
+	end
+
+	destroyNameGui()
+	currentTargetTorso = nil
+
+	local cam = workspace.CurrentCamera
+	cam.CameraType = savedCamType or Enum.CameraType.Custom
+
+	local char = localPlayer.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	cam.CameraSubject = savedCamSubject or hum
+end
+
+local function toggleTrack()
+	if trackEnabled then
+		disableTrack()
+	else
+		enableTrack()
+	end
+end
+
+--==================== TELEPORT FOLLOW (SELF ONLY, SERVER-AUTH) ====================
+local nextTeleport = 0
+local function tickTeleportFollow()
+	if not teleportFollow then return end
+	local now = os.clock()
+	if now < nextTeleport then return end
+	nextTeleport = now + TELEPORT_INTERVAL
+
+	remote:FireServer("TP_ABOVE_CLOSEST")
+end
+
+--==================== SETUP PLAYERS ====================
+local function setupPlayer(plr: Player)
+	plr.CharacterAdded:Connect(function(char)
+		task.wait(0.15)
+
+		local att = makeMainAttachment(char, plr)
+		if att then
+			makeMainDot(plr, att)
+		end
+
+		makeJointSkeleton(char, plr)
+
+		-- base red for main dot
+		setDotColor(plr, RED)
+
+		if plr == localPlayer then
+			localAtt = att
+			rebuildBeams()
+		else
+			makeBeamTo(plr)
+		end
+	end)
+
+	plr.CharacterRemoving:Connect(function()
+		clearFor(plr)
+
+		if plr == localPlayer then
+			localAtt = nil
+			for p, b in pairs(beams) do
+				if b then b:Destroy() end
+				beams[p] = nil
+			end
+		end
+	end)
+
+	if plr.Character then
+		task.spawn(function()
+			task.wait(0.15)
+
+			local att = makeMainAttachment(plr.Character, plr)
+			if att then
+				makeMainDot(plr, att)
+			end
+			makeJointSkeleton(plr.Character, plr)
+			setDotColor(plr, RED)
+
+			if plr == localPlayer then
+				localAtt = att
+			end
+		end)
+	end
+end
+
+for _, plr in ipairs(Players:GetPlayers()) do
+	setupPlayer(plr)
+end
+
+Players.PlayerAdded:Connect(setupPlayer)
+Players.PlayerRemoving:Connect(function(plr)
+	clearFor(plr)
+	if closestPlr == plr then closestPlr = nil end
+	if currentTargetTorso and plr.Character and currentTargetTorso:IsDescendantOf(plr.Character) then
+		setTargetTorso(nil)
+	end
+end)
+
+task.delay(1, function()
+	rebuildBeams()
+end)
+
+localPlayer.CharacterAdded:Connect(function()
+	if trackEnabled then
+		task.wait(0.2)
+		disableTrack()
+		enableTrack()
+	end
+end)
+
+--==================== LOOP ====================
+RunService.RenderStepped:Connect(function()
+	updateClosestHighlight()
+	tickTeleportFollow()
+end)
+
+--==================== KEYS ====================
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then return end
+	if UserInputService:GetFocusedTextBox() then return end
+
+	if input.KeyCode == OVERLAY_KEY then
+		setOverlayEnabled(not overlayEnabled)
+
+	elseif input.KeyCode == TELEPORT_KEY then
+		teleportFollow = not teleportFollow
+
+	elseif input.KeyCode == TRACK_KEY then
+		toggleTrack()
+	end
+end)
